@@ -1,0 +1,2 @@
+rows_total,nulls_InvoiceDate,qty_negatives,prices_le_0,costs_lt_0,nulls_CustomerID,min_date,max_date,grossprofit_nans
+541909,0,10624,2521,2,135080,2010-12-01,2011-12-09,0
