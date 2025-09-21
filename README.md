@@ -40,3 +40,41 @@ flowchart LR
     A[Bronze\nDatos crudos enriquecidos] --> B[Silver\nNormalización y agregaciones]
     B --> C[Gold\nKPIs finales y tableros]
 ```
+
+---
+
+## ⚙️ Cómo ejecutar el pipeline
+
+- `python3 src/run_pipeline.py` — ejecuta todas las tareas definidas en `configs/artifacts.yml` respetando dependencias.
+- `python3 src/run_pipeline.py company_monthly_kpis country_tables` — ejecuta solo las tareas solicitadas.
+- `python3 scripts/rebuild_gold_parquet.py` — reconstruye únicamente las salidas GOLD y deja los `.parquet` listos para Looker.
+- `python3 scripts/qc_gold.py` — valida rangos de fechas, NaN/Inf y coherencia entre KPIs de país y compañía.
+
+> Requisito: crear y activar un entorno virtual con `pip install -r requirements.txt`.
+
+---
+
+## 🪙 Diccionario de datos GOLD (parquet)
+
+- `company_monthly_kpis.parquet`
+  - `period` (date, inicio de mes), `YearMonth`, `orders`, `customers`, `items_sold`, `gmv`, `returns_value`, `net_sales`, `cogs_net`, `gp_net`, `gross_margin_pct`, `net_sales_mom`, `aov`.
+- `country_monthly_kpis.parquet`
+  - `period`, `YearMonth`, `Country`, `orders`, `customers`, `items_sold`, `gmv`, `returns_value`, `return_units_abs`, `net_sales`, `cogs_net`, `gp_net`, `gross_margin_pct`, `net_sales_share`, `net_sales_mom`, `aov`, `return_rate_value`, `return_rate_units`.
+- `country_kpis.parquet`
+  - Snapshot lifetime por país con `buyers` **distintos**, `orders`, `items_sold`, `return_units_abs`, métricas monetarias y `net_sales_share_total`.
+- `product_monthly_kpis.parquet`
+  - `period`, `YearMonth`, `StockCode`, `description_mode`, `units_sold`, `gmv`, `returns_value`, `return_units_abs`, `net_sales`, `cogs_net`, `gp_net`, `orders`, `buyers`, `aov`, `gross_margin_pct`, `return_rate_units`, `return_rate_value`.
+- `product_kpis.parquet` y `product_abc.parquet`
+  - Snapshot lifetime con compradores únicos, tasas de devolución y clasificación ABC por contribución a ventas netas.
+- `customer_monthly_kpis.parquet`
+  - `period`, `YearMonth`, `customer_id`, `orders` (solo ventas), `items_sold` (solo ventas), `gmv`, `returns_value`, `net_sales`, `cogs_net`, `gp_net`, `aov`.
+- `returns_*` (por factura/producto/país/mes)
+  - Métricas absolutas (`return_units_abs`, `returns_value`, `returns_cogs`) y tasas sobre ventas.
+
+Todas las salidas de la capa GOLD se guardan en `data/gold/*.parquet` utilizando `pyarrow`, sin cálculos derivados a nivel de Looker.
+
+---
+
+## ✅ Tests
+
+- `python3 -m unittest discover -s tests` — valida la lógica crítica de KPIs (conteo de compradores únicos, separación ventas/devoluciones).

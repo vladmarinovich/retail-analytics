@@ -1,9 +1,16 @@
-from pathlib import Path
-import pandas as pd
+"""Deprecated helper preserved for backwards compatibility.
 
-GOLD = Path("data/gold")
-for csv in GOLD.glob("*.csv"):
-    df = pd.read_csv(csv)
-    parquet = csv.with_suffix(".parquet")
-    df.to_parquet(parquet, index=False)
-    print("OK ->", parquet)
+Use ``scripts/rebuild_gold_parquet.py`` instead.
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from rebuild_gold_parquet import main  # type: ignore
+
+
+if __name__ == "__main__":
+    main()

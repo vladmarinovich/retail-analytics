@@ -4,3 +4,6 @@ python-dateutil
 streamlit
 scikit-learn
 mlxtend
+pandera
+pyarrow
+PyYAML

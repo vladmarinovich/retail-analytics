@@ -1,211 +1,216 @@
-# src/gold/build_country_tables.py
-# --------------------------------
-# GOLD Country: KPIs por país (snapshot lifetime) y serie mensual.
-# Entradas preferidas: data/silver/country_monthly.csv
-# Fallback: data/silver/transactions_base.csv
-# Salidas:
-#   data/gold/country_kpis.csv
-#   data/gold/country_monthly_kpis.csv
+"""Build GOLD country-level KPI tables."""
+from __future__ import annotations
 
-from pathlib import Path
 import numpy as np
 import pandas as pd
 
-BASE = Path(__file__).resolve().parents[2]
-SILVER = BASE / "data" / "silver"
-GOLD = BASE / "data" / "gold"
+from features.metrics import (
+    calc_aov,
+    calc_return_rate_value,
+    calc_return_units,
+    ensure_period,
+    safe_div,
+)
+from utils.data import load_transactions
+from utils.io import get_paths, logger, write_parquet
+from utils.schemas import country_monthly_kpis_schema
 
-CM_PATH = SILVER / "country_monthly.csv"
-TX_PATH = SILVER / "transactions_base.csv"
-
-OUT_SNAPSHOT = GOLD / "country_kpis.csv"
-OUT_MONTHLY = GOLD / "country_monthly_kpis.csv"
+PATHS = get_paths()
+COUNTRY_MONTHLY_PATH = PATHS.gold / "country_monthly_kpis.parquet"
+COUNTRY_SNAPSHOT_PATH = PATHS.gold / "country_kpis.parquet"
 
 
-def ensure_dirs():
-    GOLD.mkdir(parents=True, exist_ok=True)
+def build_country_monthly(df: pd.DataFrame) -> pd.DataFrame:
+    sales = df[~df["IsReturn"]].copy()
+    returns = df[df["IsReturn"]].copy()
 
+    grouped_sales = sales.groupby(["Country", "YearMonth"], dropna=False)
+    grouped_returns = returns.groupby(["Country", "YearMonth"], dropna=False)
+    grouped_all = df.groupby(["Country", "YearMonth"], dropna=False)
 
-def load_country_monthly() -> pd.DataFrame:
-    """
-    Carga country_monthly desde Silver; si no existe, lo construye rápido desde transactions_base.
-    Incluye parches:
-      - Renombrar sinónimos (buyers->customers, gp/gross_profit(_net)->gp_net).
-      - Derivar cogs_net si falta (net_sales - gp_net) o traerlo desde transactions_base.
-    """
-    if CM_PATH.exists():
-        cm = pd.read_csv(CM_PATH)
-
-        # Normalizaciones suaves
-        cm["Country"] = cm["Country"].astype("string").str.strip()
-        cm["YearMonth"] = cm["YearMonth"].astype(str)
-
-        # --- Renombra sinónimos esperados ---
-        rename_map = {
-            "buyers": "customers",
-            "gp": "gp_net",
-            "gross_profit_net": "gp_net",
-            "gross_profit": "gp_net",
-        }
-        cm = cm.rename(
-            columns={k: v for k, v in rename_map.items() if k in cm.columns})
-
-        # --- Si falta cogs_net, intentar derivarlo ---
-        if "cogs_net" not in cm.columns:
-            if {"net_sales", "gp_net"}.issubset(cm.columns):
-                cm["cogs_net"] = cm["net_sales"] - cm["gp_net"]
-            else:
-                # Fallback: traer cogs_net desde transactions_base
-                if not TX_PATH.exists():
-                    raise ValueError(
-                        "country_monthly no tiene cogs_net ni gp_net y no existe transactions_base para reconstruir."
-                    )
-                t = pd.read_csv(TX_PATH)
-                if "YearMonth" not in t.columns:
-                    t["YearMonth"] = pd.to_datetime(
-                        t["InvoiceDate"]).dt.to_period("M").astype(str)
-                # cogs_net en silver ya es COGS con signo (ventas +, devoluciones -)
-                cogs_net_by_cty = (
-                    t.groupby(["Country", "YearMonth"])["COGS"].sum()
-                    .rename("cogs_net")
-                    .reset_index()
-                )
-                cm = cm.merge(cogs_net_by_cty, on=[
-                              "Country", "YearMonth"], how="left")
-
-        # Validación mínima
-        needed = {
-            "Country", "YearMonth", "gmv", "returns_value", "net_sales", "cogs_net", "gp_net",
-            "orders", "customers", "items_sold"
-        }
-        missing = needed - set(cm.columns)
-        if missing:
-            raise ValueError(
-                f"country_monthly.csv le faltan columnas (tras normalizar): {missing}")
-
-        return cm
-
-    # ---- Fallback: construir desde transactions_base ----
-    if not TX_PATH.exists():
-        raise FileNotFoundError(f"No encuentro {CM_PATH} ni {TX_PATH}")
-
-    t = pd.read_csv(TX_PATH)
-    if "IsReturn" not in t.columns:
-        t["IsReturn"] = t["Quantity"] < 0
-    if "YearMonth" not in t.columns:
-        t["YearMonth"] = pd.to_datetime(
-            t["InvoiceDate"]).dt.to_period("M").astype(str)
-
-    t["Country"] = t["Country"].astype("string").str.strip()
-    is_sale = ~t["IsReturn"]
-    is_ret = t["IsReturn"]
-
-    g = t.groupby(["Country", "YearMonth"], dropna=False)
-    cm = g.agg(
-        gmv=("Sales", lambda s: s[is_sale.loc[s.index]].sum()),
-        returns_value=("Sales", lambda s: np.abs(
-            s[is_ret.loc[s.index]].sum())),
+    monthly = grouped_all.agg(
         net_sales=("Sales", "sum"),
         cogs_net=("COGS", "sum"),
         gp_net=("GrossProfit", "sum"),
-        orders=("InvoiceNo", lambda x: x[is_sale.loc[x.index]].nunique()),
-        customers=("CustomerID", lambda c: c[is_sale.loc[c.index]].nunique()),
-        items_sold=("Quantity", lambda q: q[is_sale.loc[q.index]].sum()),
     ).reset_index()
 
-    # métricas derivadas
-    cm["gross_margin_pct"] = np.where(
-        cm["net_sales"] != 0, cm["gp_net"] / cm["net_sales"], np.nan)
-    # participación por mes
-    total_mes = cm.groupby("YearMonth")["net_sales"].transform("sum")
-    cm["net_sales_share"] = np.where(
-        total_mes > 0, cm["net_sales"] / total_mes, np.nan)
-
-    return cm
-
-
-def build_snapshot(cm: pd.DataFrame) -> pd.DataFrame:
-    """
-    Snapshot lifetime por país sumando todos los meses.
-    """
-    g = cm.groupby("Country", dropna=False)
-    snap = g.agg(
-        first_period=("YearMonth", "min"),
-        last_period=("YearMonth", "max"),
-        orders=("orders", "sum"),
-        buyers=("customers", "sum"),
-        items_sold=("items_sold", "sum"),
-        gmv=("gmv", "sum"),
-        returns_value=("returns_value", "sum"),
-        net_sales=("net_sales", "sum"),
-        cogs_net=("cogs_net", "sum"),
-        gp_net=("gp_net", "sum"),
-    ).reset_index()
-
-    snap["gross_margin_pct"] = np.where(
-        snap["net_sales"] != 0, snap["gp_net"] / snap["net_sales"], np.nan
+    monthly = monthly.merge(
+        grouped_sales.agg(
+            orders=("InvoiceNo", "nunique"),
+            customers=("CustomerID", lambda s: s.dropna().nunique()),
+            items_sold=("Quantity", "sum"),
+            gmv=("Sales", "sum"),
+        ).reset_index(),
+        on=["Country", "YearMonth"],
+        how="left",
     )
-    # participación total sobre el período completo
-    total_ns = float(snap["net_sales"].clip(lower=0).sum()) or 1.0
-    snap["net_sales_share_total"] = snap["net_sales"].clip(lower=0) / total_ns
 
-    # redondeos
-    money = ["gmv", "returns_value", "net_sales", "cogs_net", "gp_net"]
-    snap[money] = snap[money].round(2)
-    snap["gross_margin_pct"] = snap["gross_margin_pct"].round(4)
-    snap["net_sales_share_total"] = snap["net_sales_share_total"].round(4)
+    returns_metrics = grouped_returns.agg(
+        returns_value=("Sales", lambda s: np.abs(s.sum())),
+        return_units_abs=("Quantity", lambda q: np.abs(q.sum())),
+    ).reset_index()
+    monthly = monthly.merge(
+        returns_metrics,
+        on=["Country", "YearMonth"],
+        how="left",
+    )
+    monthly[["returns_value", "return_units_abs"]] = monthly[[
+        "returns_value", "return_units_abs"
+    ]].fillna(0.0)
 
-    # ordenar por importancia
-    snap = snap.sort_values("net_sales", ascending=False)
-    cols = [
-        "Country", "first_period", "last_period", "orders", "buyers", "items_sold",
-        "gmv", "returns_value", "net_sales", "cogs_net", "gp_net",
-        "gross_margin_pct", "net_sales_share_total"
-    ]
-    return snap[cols]
+    fill_zero = ["orders", "customers", "items_sold", "gmv"]
+    for col in fill_zero:
+        monthly[col] = monthly[col].fillna(0)
+    monthly["orders"] = monthly["orders"].astype("Int64")
+    monthly["customers"] = monthly["customers"].astype("Int64")
+    monthly["items_sold"] = monthly["items_sold"].astype(float)
+    monthly["gmv"] = monthly["gmv"].astype(float)
 
+    monthly = ensure_period(monthly, "YearMonth", "period")
+    monthly = calc_aov(monthly)
+    monthly = calc_return_rate_value(monthly)
+    monthly = calc_return_units(monthly)
 
-def prepare_monthly(cm: pd.DataFrame) -> pd.DataFrame:
-    """
-    Serie mensual por país con ratios y crecimiento.
-    """
-    out = cm.copy()
+    monthly["gross_margin_pct"] = safe_div(monthly["gp_net"], monthly["net_sales"])
 
-    # redondeos
-    money = ["gmv", "returns_value", "net_sales", "cogs_net", "gp_net"]
-    out[money] = out[money].round(2)
-    for c in ["gross_margin_pct", "net_sales_share"]:
-        if c in out.columns:
-            out[c] = out[c].round(4)
-
-    # crecimiento MoM de ventas netas por país
-    out = out.sort_values(["Country", "YearMonth"])
-    out["net_sales_mom"] = (
-        out.groupby("Country")["net_sales"]
+    monthly = monthly.sort_values(["Country", "period"]).reset_index(drop=True)
+    monthly["net_sales_mom"] = (
+        monthly.groupby("Country")["net_sales"]
         .pct_change()
         .replace([np.inf, -np.inf], np.nan)
-        .round(4)
     )
+    total_per_month = monthly.groupby("YearMonth")["net_sales"].transform("sum")
+    monthly["net_sales_share"] = safe_div(monthly["net_sales"], total_per_month)
+
+    # Standardize column order
+    cols = [
+        "period",
+        "YearMonth",
+        "Country",
+        "orders",
+        "customers",
+        "items_sold",
+        "gmv",
+        "returns_value",
+        "return_units_abs",
+        "net_sales",
+        "cogs_net",
+        "gp_net",
+        "gross_margin_pct",
+        "net_sales_share",
+        "net_sales_mom",
+        "aov",
+        "return_rate_value",
+        "return_rate_units",
+    ]
+    monthly = monthly[cols]
+
+    monthly = country_monthly_kpis_schema.validate(monthly, lazy=True)
+
+    money_cols = ["gmv", "returns_value", "net_sales", "cogs_net", "gp_net", "aov"]
+    monthly[money_cols] = monthly[money_cols].round(2)
+    pct_cols = [
+        "gross_margin_pct",
+        "net_sales_share",
+        "net_sales_mom",
+        "return_rate_value",
+        "return_rate_units",
+    ]
+    monthly[pct_cols] = monthly[pct_cols].round(4)
+    monthly["return_units_abs"] = monthly["return_units_abs"].round(2)
+    monthly["items_sold"] = monthly["items_sold"].round(2)
+
+    return monthly
+
+
+def build_country_snapshot(df: pd.DataFrame, monthly: pd.DataFrame) -> pd.DataFrame:
+    sales = df[~df["IsReturn"]].copy()
+    returns = df[df["IsReturn"]].copy()
+
+    base = df.groupby("Country", dropna=False).agg(
+        net_sales=("Sales", "sum"),
+        cogs_net=("COGS", "sum"),
+        gp_net=("GrossProfit", "sum"),
+    ).reset_index()
+
+    sales_agg = sales.groupby("Country", dropna=False).agg(
+        gmv=("Sales", "sum"),
+        items_sold=("Quantity", "sum"),
+        orders=("InvoiceNo", "nunique"),
+        buyers=("CustomerID", lambda s: s.dropna().nunique()),
+    ).reset_index()
+
+    returns_agg = returns.groupby("Country", dropna=False).agg(
+        returns_value=("Sales", lambda s: np.abs(s.sum())),
+        return_units_abs=("Quantity", lambda q: np.abs(q.sum())),
+    ).reset_index()
+
+    snap = base.merge(sales_agg, on="Country", how="left")
+    snap = snap.merge(returns_agg, on="Country", how="left")
+
+    snap[["gmv", "items_sold", "orders", "buyers", "returns_value", "return_units_abs"]] = snap[[
+        "gmv", "items_sold", "orders", "buyers", "returns_value", "return_units_abs"
+    ]].fillna(0)
+    snap["orders"] = snap["orders"].astype("Int64")
+    snap["buyers"] = snap["buyers"].astype("Int64")
+
+    first_last = monthly.groupby("Country").agg(
+        first_period=("YearMonth", "min"),
+        last_period=("YearMonth", "max"),
+    ).reset_index()
+    snap = snap.merge(first_last, on="Country", how="left")
+
+    snap["gross_margin_pct"] = safe_div(snap["gp_net"], snap["net_sales"])
+    total_ns = snap["net_sales"].clip(lower=0).sum() or 1.0
+    snap["net_sales_share_total"] = safe_div(snap["net_sales"].clip(lower=0), total_ns)
+
+    money_cols = ["gmv", "returns_value", "net_sales", "cogs_net", "gp_net"]
+    snap[money_cols] = snap[money_cols].round(2)
+    snap[["items_sold", "return_units_abs"]] = snap[["items_sold", "return_units_abs"]].round(2)
+    snap[["gross_margin_pct", "net_sales_share_total"]] = snap[[
+        "gross_margin_pct", "net_sales_share_total"
+    ]].round(4)
 
     cols = [
-        "Country", "YearMonth", "orders", "customers", "items_sold",
-        "gmv", "returns_value", "net_sales", "cogs_net", "gp_net",
-        "gross_margin_pct", "net_sales_share", "net_sales_mom"
+        "Country",
+        "first_period",
+        "last_period",
+        "orders",
+        "buyers",
+        "items_sold",
+        "return_units_abs",
+        "gmv",
+        "returns_value",
+        "net_sales",
+        "cogs_net",
+        "gp_net",
+        "gross_margin_pct",
+        "net_sales_share_total",
     ]
-    return out[cols]
+    snap = snap[cols].sort_values("net_sales", ascending=False).reset_index(drop=True)
+    return snap
 
 
-def main():
-    ensure_dirs()
-    cm = load_country_monthly()
-    snap = build_snapshot(cm)
-    monthly = prepare_monthly(cm)
+def build_country_tables() -> dict[str, pd.DataFrame]:
+    tx = load_transactions()
+    monthly = build_country_monthly(tx)
+    snapshot = build_country_snapshot(tx, monthly)
+    return {
+        "country_monthly_kpis": monthly,
+        "country_kpis": snapshot,
+    }
 
-    snap.to_csv(OUT_SNAPSHOT, index=False)
-    monthly.to_csv(OUT_MONTHLY, index=False)
 
-    print(f"[OK] {OUT_SNAPSHOT}         -> {len(snap):,} filas")
-    print(f"[OK] {OUT_MONTHLY}          -> {len(monthly):,} filas")
+def main() -> dict[str, pd.DataFrame]:
+    outputs = build_country_tables()
+    write_parquet(outputs["country_monthly_kpis"], COUNTRY_MONTHLY_PATH)
+    write_parquet(outputs["country_kpis"], COUNTRY_SNAPSHOT_PATH)
+    logger.info(
+        "country_monthly_kpis rows=%s | country_kpis rows=%s",
+        len(outputs["country_monthly_kpis"]),
+        len(outputs["country_kpis"]),
+    )
+    return outputs
 
 
 if __name__ == "__main__":

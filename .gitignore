@@ -17,3 +17,7 @@ data/**/*
 
 # Mac
 .DS_Store
+#Key bigquery
+keys/*
+*.json
+!keys/.gitkeep

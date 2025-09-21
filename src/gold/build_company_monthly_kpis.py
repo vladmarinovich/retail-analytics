@@ -1,43 +1,98 @@
-from pathlib import Path
+"""Build GOLD company-level monthly KPIs."""
+from __future__ import annotations
+
 import numpy as np
 import pandas as pd
 
-BASE = Path(__file__).resolve().parents[2]
-SILVER = BASE / "data" / "silver" / "transactions_base.csv"
-OUT = BASE / "data" / "gold" / "company_monthly_kpis.csv"
+from features.metrics import calc_aov, ensure_period, safe_div
+from utils.data import load_transactions
+from utils.io import get_paths, logger, write_parquet
+from utils.schemas import company_monthly_kpis_schema
+
+PATHS = get_paths()
+OUTPUT_PATH = PATHS.gold / "company_monthly_kpis.parquet"
 
 
-def main():
-    df = pd.read_csv(SILVER)
-    if "YearMonth" not in df.columns:
-        df["YearMonth"] = pd.to_datetime(
-            df["InvoiceDate"]).dt.to_period("M").astype(str)
-    is_sale = ~(df.get("IsReturn", df["Quantity"] < 0))
-    g = df.groupby("YearMonth", dropna=False)
-    out = g.agg(
-        orders=("InvoiceNo", lambda x: x[is_sale.loc[x.index]].nunique()),
-        customers=("CustomerID", lambda c: c[is_sale.loc[c.index]].nunique()),
-        items_sold=("Quantity", lambda q: q[is_sale.loc[q.index]].sum()),
-        gmv=("Sales", lambda s: s[is_sale.loc[s.index]].sum()),
-        returns_value=("Sales", lambda s: np.abs(
-            s[~is_sale.loc[s.index]].sum())),
+def build_company_monthly() -> pd.DataFrame:
+    df = load_transactions()
+    sales = df[~df["IsReturn"]].copy()
+    returns = df[df["IsReturn"]].copy()
+
+    grouped_all = df.groupby("YearMonth", dropna=False)
+    grouped_sales = sales.groupby("YearMonth", dropna=False)
+    grouped_returns = returns.groupby("YearMonth", dropna=False)
+
+    monthly = grouped_all.agg(
         net_sales=("Sales", "sum"),
         cogs_net=("COGS", "sum"),
         gp_net=("GrossProfit", "sum"),
     ).reset_index()
-    out["gross_margin_pct"] = np.where(
-        out["net_sales"] != 0, out["gp_net"]/out["net_sales"], np.nan)
-    out = out.sort_values("YearMonth")
-    out["net_sales_mom"] = (
-        out["net_sales"].pct_change().replace(
-            [np.inf, -np.inf], np.nan).round(4)
+
+    monthly = monthly.merge(
+        grouped_sales.agg(
+            orders=("InvoiceNo", "nunique"),
+            customers=("CustomerID", lambda s: s.dropna().nunique()),
+            items_sold=("Quantity", "sum"),
+            gmv=("Sales", "sum"),
+        ).reset_index(),
+        on="YearMonth",
+        how="left",
     )
-    money = ["gmv", "returns_value", "net_sales", "cogs_net", "gp_net"]
-    out[money] = out[money].round(2)
-    out["gross_margin_pct"] = out["gross_margin_pct"].round(4)
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    out.to_csv(OUT, index=False)
-    print(f"[OK] {OUT} -> {len(out)} filas")
+
+    returns_metrics = grouped_returns.agg(
+        returns_value=("Sales", lambda s: np.abs(s.sum())),
+    ).reset_index()
+
+    monthly = monthly.merge(returns_metrics, on="YearMonth", how="left")
+    monthly[["returns_value"]] = monthly[["returns_value"]].fillna(0.0)
+
+    for col in ["orders", "customers"]:
+        monthly[col] = monthly[col].fillna(0).astype("Int64")
+    monthly["items_sold"] = monthly["items_sold"].fillna(0.0)
+    monthly["gmv"] = monthly["gmv"].fillna(0.0)
+
+    monthly = ensure_period(monthly, "YearMonth", "period")
+    monthly = calc_aov(monthly)
+    monthly["gross_margin_pct"] = safe_div(monthly["gp_net"], monthly["net_sales"])
+
+    monthly = monthly.sort_values("period").reset_index(drop=True)
+    monthly["net_sales_mom"] = (
+        monthly["net_sales"].pct_change().replace([np.inf, -np.inf], np.nan)
+    )
+
+    cols = [
+        "period",
+        "YearMonth",
+        "orders",
+        "customers",
+        "items_sold",
+        "gmv",
+        "returns_value",
+        "net_sales",
+        "cogs_net",
+        "gp_net",
+        "gross_margin_pct",
+        "net_sales_mom",
+        "aov",
+    ]
+    monthly = monthly[cols]
+
+    monthly = company_monthly_kpis_schema.validate(monthly, lazy=True)
+
+    money_cols = ["gmv", "returns_value", "net_sales", "cogs_net", "gp_net", "aov"]
+    monthly[money_cols] = monthly[money_cols].round(2)
+    pct_cols = ["gross_margin_pct", "net_sales_mom"]
+    monthly[pct_cols] = monthly[pct_cols].round(4)
+    monthly["items_sold"] = monthly["items_sold"].round(2)
+
+    return monthly
+
+
+def main() -> pd.DataFrame:
+    monthly = build_company_monthly()
+    write_parquet(monthly, OUTPUT_PATH)
+    logger.info("company_monthly_kpis rows=%s", len(monthly))
+    return monthly
 
 
 if __name__ == "__main__":

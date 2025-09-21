@@ -1,118 +1,119 @@
-# src/gold/build_monthly_invoices.py
-"""
-Genera data/gold/revenue_monthly.csv desde data/silver/transactions_base.csv
+"""Generate GOLD revenue monthly KPIs."""
+from __future__ import annotations
 
-Métricas por mes (YYYY-MM):
-- sales_gross          : ventas brutas ($, solo Quantity>0)
-- returns_gross        : devoluciones brutas ($, absoluto de Quantity<0)
-- net_sales            : sales_gross - returns_gross
-- cogs_sales           : COGS de ventas (Quantity>0)
-- cogs_returns         : COGS de devoluciones (absoluto de Quantity<0)
-- net_cogs             : cogs_sales - cogs_returns
-- gross_profit         : net_sales - net_cogs
-- margin_pct           : gross_profit / net_sales (si net_sales>0)
-- orders               : # facturas de venta únicas (InvoiceNo con Quantity>0)
-- credit_notes         : # notas de crédito únicas (InvoiceNo con Quantity<0)
-- return_rate_pct      : returns_gross / sales_gross (si sales_gross>0)
-"""
-
-from pathlib import Path
 import argparse
-import pandas as pd
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
+
+from features.metrics import ensure_period, safe_div
+from utils.data import load_transactions
+from utils.io import get_paths, logger, write_parquet
+
+PATHS = get_paths()
+DEFAULT_INPUT = PATHS.silver / "transactions_base.csv"
+DEFAULT_OUTPUT = PATHS.gold / "revenue_monthly.parquet"
 
 
-def build_revenue_monthly(inp: Path, outp: Path):
-    df = pd.read_csv(inp)
+def build_revenue_monthly(df: pd.DataFrame | None = None) -> pd.DataFrame:
+    tx = df.copy() if df is not None else load_transactions()
 
-    # Asegurar tipos
-    df["InvoiceDate"] = pd.to_datetime(df["InvoiceDate"])
-    # Por si no existen estas columnas exactas, calcula on-the-fly
-    if "UnitCost" not in df.columns:
-        raise ValueError(
-            "transactions_base debe contener la columna 'UnitCost'.")
-    if "UnitPrice" not in df.columns or "Quantity" not in df.columns:
-        raise ValueError("Faltan 'UnitPrice' o 'Quantity'.")
+    if "InvoiceDate" not in tx.columns:
+        raise ValueError("transactions_base must include 'InvoiceDate'.")
 
-    df["month"] = df["InvoiceDate"].dt.to_period("M").astype(str)
+    tx["InvoiceDate"] = pd.to_datetime(tx["InvoiceDate"], errors="raise")
+    tx["YearMonth"] = tx["InvoiceDate"].dt.to_period("M").astype(str)
 
-    # Ventas (Quantity > 0) y devoluciones (Quantity < 0)
-    sales = df[df["Quantity"] > 0].copy()
-    returns = df[df["Quantity"] < 0].copy()
+    if "IsReturn" not in tx.columns:
+        tx["IsReturn"] = tx["Quantity"] < 0
 
-    # Valores monetarios
-    sales["sales_gross_line"] = sales["UnitPrice"] * sales["Quantity"]
-    sales["cogs_line"] = sales["UnitCost"] * sales["Quantity"]
-    returns["returns_gross_ln"] = - \
-        (returns["UnitPrice"] * returns["Quantity"])  # abs$
-    returns["cogs_ret_ln"] = - \
-        (returns["UnitCost"] * returns["Quantity"])  # abs$
+    sales = tx[~tx["IsReturn"]].copy()
+    returns = tx[tx["IsReturn"]].copy()
 
-    # Agregaciones por mes
-    agg_sales = sales.groupby("month").agg(
+    sales["sales_gross_line"] = sales["Quantity"] * sales["UnitPrice"]
+    sales["cogs_line"] = sales["Quantity"] * sales["UnitCost"]
+    returns["returns_gross_ln"] = np.abs(returns["Quantity"] * returns["UnitPrice"])
+    returns["cogs_ret_ln"] = np.abs(returns["Quantity"] * returns["UnitCost"])
+
+    sales_agg = sales.groupby("YearMonth").agg(
         sales_gross=("sales_gross_line", "sum"),
         cogs_sales=("cogs_line", "sum"),
         orders=("InvoiceNo", "nunique"),
     )
 
-    agg_returns = returns.groupby("month").agg(
+    returns_agg = returns.groupby("YearMonth").agg(
         returns_gross=("returns_gross_ln", "sum"),
         cogs_returns=("cogs_ret_ln", "sum"),
         credit_notes=("InvoiceNo", "nunique"),
     )
 
-    # Unir y calcular KPIs
     monthly = (
-        agg_sales.join(agg_returns, how="outer")
+        sales_agg.join(returns_agg, how="outer")
         .fillna(0.0)
         .reset_index()
-        .rename(columns={"month": "period"})
-        .sort_values("period")
+        .sort_values("YearMonth")
     )
 
     monthly["net_sales"] = monthly["sales_gross"] - monthly["returns_gross"]
     monthly["net_cogs"] = monthly["cogs_sales"] - monthly["cogs_returns"]
     monthly["gross_profit"] = monthly["net_sales"] - monthly["net_cogs"]
+    monthly["margin_pct"] = safe_div(monthly["gross_profit"], monthly["net_sales"])
+    monthly["return_rate_pct"] = safe_div(monthly["returns_gross"], monthly["sales_gross"])
 
-    # % margen y % devoluciones
-    monthly["margin_pct"] = np.where(
-        monthly["net_sales"] > 0, monthly["gross_profit"] /
-        monthly["net_sales"], np.nan
-    )
-    monthly["return_rate_pct"] = np.where(
-        monthly["sales_gross"] > 0, monthly["returns_gross"] /
-        monthly["sales_gross"], 0.0
-    )
+    monthly = ensure_period(monthly, "YearMonth", "period")
 
-    # Redondeos amigables
     money_cols = [
-        "sales_gross", "returns_gross", "net_sales",
-        "cogs_sales", "cogs_returns", "net_cogs", "gross_profit"
+        "sales_gross",
+        "returns_gross",
+        "net_sales",
+        "cogs_sales",
+        "cogs_returns",
+        "net_cogs",
+        "gross_profit",
     ]
     monthly[money_cols] = monthly[money_cols].round(2)
-    monthly[["margin_pct", "return_rate_pct"]] = monthly[[
-        "margin_pct", "return_rate_pct"]].round(4)
+    monthly[["margin_pct", "return_rate_pct"]] = monthly[["margin_pct", "return_rate_pct"]].round(4)
 
-    # Guardar
-    outp.parent.mkdir(parents=True, exist_ok=True)
-    monthly.to_csv(outp, index=False)
-    print(f"OK → {outp} ({len(monthly)} filas)")
+    col_order = [
+        "period",
+        "YearMonth",
+        "sales_gross",
+        "returns_gross",
+        "net_sales",
+        "cogs_sales",
+        "cogs_returns",
+        "net_cogs",
+        "gross_profit",
+        "margin_pct",
+        "return_rate_pct",
+        "orders",
+        "credit_notes",
+    ]
+    for col in ["orders", "credit_notes"]:
+        if col not in monthly.columns:
+            monthly[col] = 0
+        monthly[col] = monthly[col].astype("Int64")
+    monthly = monthly[col_order]
+
+    return monthly
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--inp",
-        default="data/silver/transactions_base.csv",
-        help="Ruta del CSV base en silver",
-    )
-    parser.add_argument(
-        "--outp",
-        default="data/gold/revenue_monthly.csv",
-        help="Ruta de salida para la tabla gold",
-    )
-    args = parser.parse_args()
-    build_revenue_monthly(Path(args.inp), Path(args.outp))
+def main(argv: list[str] | None = None) -> pd.DataFrame:
+    parser = argparse.ArgumentParser(description="Build revenue monthly KPIs")
+    parser.add_argument("--inp", default=str(DEFAULT_INPUT))
+    parser.add_argument("--out", default=str(DEFAULT_OUTPUT))
+    args = parser.parse_args(argv)
+
+    if str(DEFAULT_INPUT) == args.inp:
+        monthly = build_revenue_monthly()
+    else:
+        monthly = build_revenue_monthly(pd.read_csv(args.inp, parse_dates=["InvoiceDate"]))
+
+    out_path = Path(args.out)
+    write_parquet(monthly, out_path)
+    logger.info("revenue_monthly rows=%s", len(monthly))
+    return monthly
 
 
 if __name__ == "__main__":

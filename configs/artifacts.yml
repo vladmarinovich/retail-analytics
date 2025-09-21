@@ -1,0 +1,40 @@
+artifacts:
+  transactions_base:
+    layer: silver
+    entrypoint: silver.bronze_to_transactions:main
+    inputs:
+      - data/bronze/online_retail_enriched.csv
+    outputs:
+      - data/silver/transactions_base.csv
+  company_monthly_kpis:
+    layer: gold
+    entrypoint: gold.build_company_monthly_kpis:main
+    inputs:
+      - data/silver/transactions_base.csv
+    outputs:
+      - data/gold/company_monthly_kpis.parquet
+  country_tables:
+    layer: gold
+    entrypoint: gold.build_country_tables:main
+    inputs:
+      - data/silver/transactions_base.csv
+    outputs:
+      - data/gold/country_monthly_kpis.parquet
+      - data/gold/country_kpis.parquet
+  product_tables:
+    layer: gold
+    entrypoint: gold.build_product_tables:main
+    inputs:
+      - data/silver/transactions_base.csv
+      - data/silver/dim_product.csv
+    outputs:
+      - data/gold/product_monthly_kpis.parquet
+      - data/gold/product_kpis.parquet
+      - data/gold/product_abc.parquet
+  customer_monthly_kpis:
+    layer: gold
+    entrypoint: gold.build_customer_monthly:main
+    inputs:
+      - data/silver/transactions_base.csv
+    outputs:
+      - data/gold/customer_monthly_kpis.parquet
