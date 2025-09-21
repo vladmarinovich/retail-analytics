@@ -65,9 +65,9 @@ def build_product_monthly(tx: pd.DataFrame, dim: pd.DataFrame) -> pd.DataFrame:
         on=["StockCode", "YearMonth"],
         how="left",
     )
-    monthly[["return_units_abs", "returns_value"]] = monthly[[
-        "return_units_abs", "returns_value"
-    ]].fillna(0.0)
+    monthly[["return_units_abs", "returns_value"]] = monthly[
+        ["return_units_abs", "returns_value"]
+    ].fillna(0.0)
 
     for col in ["units_sold", "gmv"]:
         monthly[col] = monthly[col].fillna(0.0)
@@ -87,14 +87,20 @@ def build_product_monthly(tx: pd.DataFrame, dim: pd.DataFrame) -> pd.DataFrame:
         base_units_col="units_sold",
     )
     monthly = calc_return_rate_value(monthly)
-    monthly["gross_margin_pct"] = safe_div(monthly["gp_net"], monthly["net_sales"])
+    monthly["gross_margin_pct"] = safe_div(
+        monthly["gp_net"], monthly["net_sales"])
 
     if not dim.empty:
         monthly = monthly.merge(dim, on="StockCode", how="left")
     else:
         monthly["description_mode"] = pd.NA
 
-    monthly = monthly.sort_values(["StockCode", "period"]).reset_index(drop=True)
+    # Orden por SKU y periodo + MoM por SKU
+    monthly = monthly.sort_values(
+        ["StockCode", "period"]).reset_index(drop=True)
+    monthly["net_sales_mom"] = monthly.groupby("StockCode")["net_sales"].pct_change()
+    monthly["net_sales_mom"] = safe_div(monthly["net_sales_mom"], 1.0)
+
     cols = [
         "period",
         "YearMonth",
@@ -113,6 +119,7 @@ def build_product_monthly(tx: pd.DataFrame, dim: pd.DataFrame) -> pd.DataFrame:
         "gross_margin_pct",
         "return_rate_units",
         "return_rate_value",
+        "net_sales_mom",
     ]
     monthly = monthly[cols]
 
@@ -127,11 +134,13 @@ def build_product_monthly(tx: pd.DataFrame, dim: pd.DataFrame) -> pd.DataFrame:
         "aov",
     ]
     monthly[money_cols] = monthly[money_cols].round(2)
-    pct_cols = ["gross_margin_pct", "return_rate_units", "return_rate_value"]
-    monthly[pct_cols] = monthly[pct_cols].round(4)
-    monthly[["units_sold", "return_units_abs"]] = monthly[[
-        "units_sold", "return_units_abs"
-    ]].round(2)
+    pct_cols = ["gross_margin_pct", "return_rate_units",
+                "return_rate_value", "net_sales_mom"]
+    monthly[pct_cols] = monthly[pct_cols].round(4).fillna(0.0)
+    monthly[["units_sold", "return_units_abs"]] = monthly[
+        ["units_sold", "return_units_abs"]
+    ].round(2)
+    monthly["aov"] = monthly["aov"].fillna(0.0)
 
     return monthly
 
@@ -161,9 +170,10 @@ def build_product_snapshot(tx: pd.DataFrame, monthly: pd.DataFrame, dim: pd.Data
     snap = base.merge(sales_agg, on="StockCode", how="left")
     snap = snap.merge(returns_agg, on="StockCode", how="left")
 
-    snap[["units_sold", "gmv", "orders", "buyers", "returns_value", "return_units_abs"]] = snap[[
-        "units_sold", "gmv", "orders", "buyers", "returns_value", "return_units_abs"
-    ]].fillna(0)
+    snap[["units_sold", "gmv", "orders", "buyers", "returns_value", "return_units_abs"]] = snap[
+        ["units_sold", "gmv", "orders", "buyers",
+            "returns_value", "return_units_abs"]
+    ].fillna(0)
     snap["orders"] = snap["orders"].astype("Int64")
     snap["buyers"] = snap["buyers"].astype("Int64")
 
@@ -177,15 +187,19 @@ def build_product_snapshot(tx: pd.DataFrame, monthly: pd.DataFrame, dim: pd.Data
         snap = snap.merge(dim, on="StockCode", how="left")
 
     snap["gross_margin_pct"] = safe_div(snap["gp_net"], snap["net_sales"])
-    snap["return_rate_units"] = safe_div(snap["return_units_abs"], snap["units_sold"])
+    snap["return_rate_units"] = safe_div(
+        snap["return_units_abs"], snap["units_sold"])
     snap["return_rate_value"] = safe_div(snap["returns_value"], snap["gmv"])
 
     money_cols = ["gmv", "returns_value", "net_sales", "cogs_net", "gp_net"]
     snap[money_cols] = snap[money_cols].round(2)
-    snap[["units_sold", "return_units_abs"]] = snap[["units_sold", "return_units_abs"]].round(2)
-    snap[["gross_margin_pct", "return_rate_units", "return_rate_value"]] = snap[[
-        "gross_margin_pct", "return_rate_units", "return_rate_value"
-    ]].round(4)
+    snap[["units_sold", "return_units_abs"]] = snap[[
+        "units_sold", "return_units_abs"]].round(2)
+    snap[["gross_margin_pct", "return_rate_units", "return_rate_value"]] = (
+        snap[["gross_margin_pct", "return_rate_units", "return_rate_value"]]
+        .round(4)
+        .fillna(0.0)
+    )
 
     cols = [
         "StockCode",
@@ -205,12 +219,14 @@ def build_product_snapshot(tx: pd.DataFrame, monthly: pd.DataFrame, dim: pd.Data
         "return_rate_units",
         "return_rate_value",
     ]
-    snap = snap[cols].sort_values("net_sales", ascending=False).reset_index(drop=True)
+    snap = snap[cols].sort_values(
+        "net_sales", ascending=False).reset_index(drop=True)
     return snap
 
 
 def build_product_abc(snapshot: pd.DataFrame) -> pd.DataFrame:
-    df = snapshot.copy().sort_values("net_sales", ascending=False).reset_index(drop=True)
+    df = snapshot.copy().sort_values(
+        "net_sales", ascending=False).reset_index(drop=True)
     total = float(df["net_sales"].clip(lower=0).sum()) or 1.0
     df["cum_share_net_sales"] = df["net_sales"].clip(lower=0).cumsum() / total
 

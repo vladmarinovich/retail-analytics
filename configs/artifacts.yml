@@ -38,3 +38,36 @@ artifacts:
       - data/silver/transactions_base.csv
     outputs:
       - data/gold/customer_monthly_kpis.parquet
+  customer_tables:
+    layer: gold
+    entrypoint: gold.build_customer_tables:main
+    inputs:
+      - data/silver/customers_snapshot.csv
+      - data/silver/customers_monthly.csv
+    outputs:
+      - data/gold/customer_kpis.parquet
+      - data/gold/customer_retention_monthly.parquet
+  returns_tables:
+    layer: gold
+    entrypoint: gold.build_returns_tables:main
+    inputs:
+      - data/silver/transactions_base.csv
+    outputs:
+      - data/gold/returns_invoices.parquet
+      - data/gold/returns_by_product.parquet
+      - data/gold/returns_by_country.parquet
+      - data/gold/returns_monthly.parquet
+  revenue_monthly:
+    layer: gold
+    entrypoint: gold.build_monthly_invoices:main
+    inputs:
+      - data/silver/transactions_base.csv
+    outputs:
+      - data/gold/revenue_monthly.parquet
+  executive_summary:
+    layer: gold
+    entrypoint: gold.build_executive_summary:main
+    inputs:
+      - data/gold/company_monthly_kpis.parquet
+    outputs:
+      - data/gold/executive_summary.parquet

@@ -5,16 +5,21 @@ import numpy as np
 import pandas as pd
 
 
-def safe_div(numerator, denominator):
-    """Safely divide, returning NaN where denominator is zero or null."""
+def _replace_nonfinite(value, fill_value: float = 0.0):
+    if isinstance(value, pd.DataFrame):
+        return value.replace([np.inf, -np.inf], np.nan).fillna(fill_value)
+    if isinstance(value, pd.Series):
+        return value.replace([np.inf, -np.inf], np.nan).fillna(fill_value)
+    if np.isscalar(value) and not np.isfinite(value):
+        return fill_value
+    return value
+
+
+def safe_div(numerator, denominator, fill_value: float = 0.0):
+    """Safely divide and replace non-finite results with ``fill_value`` (defaults to 0)."""
     with np.errstate(divide="ignore", invalid="ignore"):
         result = numerator / denominator
-    if isinstance(result, (pd.Series, pd.DataFrame)):
-        result = result.replace([np.inf, -np.inf], np.nan)
-    elif np.isscalar(result):
-        if not np.isfinite(result):
-            result = np.nan
-    return result
+    return _replace_nonfinite(result, fill_value=fill_value)
 
 
 def ensure_period(df: pd.DataFrame, yearmonth_col: str = "YearMonth", period_col: str = "period") -> pd.DataFrame:
@@ -27,19 +32,37 @@ def ensure_period(df: pd.DataFrame, yearmonth_col: str = "YearMonth", period_col
     return out
 
 
-def calc_aov(df: pd.DataFrame, *, net_sales_col: str = "net_sales", orders_col: str = "orders", target_col: str = "aov") -> pd.DataFrame:
+def calc_aov(
+    df: pd.DataFrame,
+    *,
+    net_sales_col: str = "net_sales",
+    orders_col: str = "orders",
+    target_col: str = "aov",
+) -> pd.DataFrame:
     out = df.copy()
     out[target_col] = safe_div(out[net_sales_col], out[orders_col])
     return out
 
 
-def calc_return_rate_value(df: pd.DataFrame, *, returns_col: str = "returns_value", base_col: str = "gmv", target_col: str = "return_rate_value") -> pd.DataFrame:
+def calc_return_rate_value(
+    df: pd.DataFrame,
+    *,
+    returns_col: str = "returns_value",
+    gmv_col: str = "gmv",
+    target_col: str = "return_rate_value",
+) -> pd.DataFrame:
     out = df.copy()
-    out[target_col] = safe_div(out[returns_col], out[base_col])
+    out[target_col] = safe_div(out[returns_col], out[gmv_col])
     return out
 
 
-def calc_return_units(df: pd.DataFrame, *, returns_units_col: str = "return_units_abs", base_units_col: str = "items_sold", target_col: str = "return_rate_units") -> pd.DataFrame:
+def calc_return_units(
+    df: pd.DataFrame,
+    *,
+    returns_units_col: str = "return_units_abs",
+    base_units_col: str = "items_sold",
+    target_col: str = "return_rate_units",
+) -> pd.DataFrame:
     out = df.copy()
     out[target_col] = safe_div(out[returns_units_col], out[base_units_col])
     return out

@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from features.metrics import calc_return_rate_value, calc_return_units, ensure_period, safe_div
 from utils.data import load_transactions
 from utils.io import get_paths, logger, read_csv, write_parquet
 
@@ -50,7 +51,9 @@ def kpis_returns(df: pd.DataFrame):
             returns_cogs=("returns_cogs", "sum"),
         ).reset_index()
     )
-    inv["period"] = pd.to_datetime(inv["InvoiceDate"]).dt.to_period("M").to_timestamp()
+    inv["period"] = (
+        pd.to_datetime(inv["InvoiceDate"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    )
 
     denom_prod = sales.groupby("StockCode").agg(
         units_sold=("Quantity", "sum"),
@@ -73,8 +76,16 @@ def kpis_returns(df: pd.DataFrame):
         prod = prod.merge(desc_mode.rename("Description"), on="StockCode", how="left")
     except Exception:
         prod["Description"] = pd.NA
-    prod["return_rate_units"] = np.where(prod["units_sold"] > 0, prod["return_units_abs"] / prod["units_sold"], np.nan)
-    prod["return_rate_value"] = np.where(prod["gmv"] > 0, prod["returns_value"] / prod["gmv"], np.nan)
+    prod = calc_return_units(
+        prod,
+        returns_units_col="return_units_abs",
+        base_units_col="units_sold",
+    )
+    prod = calc_return_rate_value(
+        prod,
+        returns_col="returns_value",
+        gmv_col="gmv",
+    )
 
     denom_ctry = sales.groupby("Country").agg(
         units_sold=("Quantity", "sum"),
@@ -89,8 +100,16 @@ def kpis_returns(df: pd.DataFrame):
         credit_notes=("InvoiceNo", "nunique"),
     )
     ctry = denom_ctry.join(ret_ctry, how="outer").fillna(0).reset_index()
-    ctry["return_rate_units"] = np.where(ctry["units_sold"] > 0, ctry["return_units_abs"] / ctry["units_sold"], np.nan)
-    ctry["return_rate_value"] = np.where(ctry["gmv"] > 0, ctry["returns_value"] / ctry["gmv"], np.nan)
+    ctry = calc_return_units(
+        ctry,
+        returns_units_col="return_units_abs",
+        base_units_col="units_sold",
+    )
+    ctry = calc_return_rate_value(
+        ctry,
+        returns_col="returns_value",
+        gmv_col="gmv",
+    )
 
     sales["YearMonth"] = sales["YearMonth"].astype(str)
     returns["YearMonth"] = returns["YearMonth"].astype(str)
@@ -106,18 +125,30 @@ def kpis_returns(df: pd.DataFrame):
         credit_notes=("InvoiceNo", "nunique"),
     )
     monthly = (
-        denom_m.join(ret_m, how="outer").fillna(0).reset_index().rename(columns={"YearMonth": "period"})
+        denom_m.join(ret_m, how="outer").fillna(0).reset_index().rename(columns={"YearMonth": "YearMonth"})
     )
-    monthly["period"] = pd.to_datetime(monthly["period"] + "-01")
-    monthly["return_rate_units"] = np.where(monthly["units_sold"] > 0, monthly["return_units_abs"] / monthly["units_sold"], np.nan)
-    monthly["return_rate_value"] = np.where(monthly["gmv"] > 0, monthly["returns_value"] / monthly["gmv"], np.nan)
+    monthly = ensure_period(monthly, "YearMonth", "period")
+    monthly = calc_return_units(
+        monthly,
+        returns_units_col="return_units_abs",
+        base_units_col="units_sold",
+    )
+    monthly = calc_return_rate_value(monthly)
 
     money_cols = ["gmv", "returns_value", "returns_cogs"]
     for df_out in (prod, ctry, monthly):
         df_out[money_cols] = df_out[money_cols].round(2)
-    prod[["return_rate_units", "return_rate_value"]] = prod[["return_rate_units", "return_rate_value"]].round(4)
-    ctry[["return_rate_units", "return_rate_value"]] = ctry[["return_rate_units", "return_rate_value"]].round(4)
-    monthly[["return_rate_units", "return_rate_value"]] = monthly[["return_rate_units", "return_rate_value"]].round(4)
+    prod[["return_rate_units", "return_rate_value"]] = (
+        prod[["return_rate_units", "return_rate_value"]].round(4).fillna(0.0)
+    )
+    ctry[["return_rate_units", "return_rate_value"]] = (
+        ctry[["return_rate_units", "return_rate_value"]].round(4).fillna(0.0)
+    )
+    monthly[["return_rate_units", "return_rate_value"]] = (
+        monthly[["return_rate_units", "return_rate_value"]]
+        .round(4)
+        .fillna(0.0)
+    )
 
     return inv, prod, ctry, monthly
 

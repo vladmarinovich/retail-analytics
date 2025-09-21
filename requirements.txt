@@ -7,3 +7,4 @@ mlxtend
 pandera
 pyarrow
 PyYAML
+google-cloud-bigquery

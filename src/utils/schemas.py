@@ -153,6 +153,8 @@ customer_monthly_kpis_schema = DataFrameSchema(
         "cogs_net": Column(pa.Float, required=True),
         "gp_net": Column(pa.Float, required=True),
         "aov": Column(pa.Float, required=True, nullable=True),
+        "gross_margin_pct": Column(pa.Float, required=True, nullable=True),
+        "net_sales_mom": Column(pa.Float, required=True, nullable=True),
     },
     coerce=True,
     strict=False,
